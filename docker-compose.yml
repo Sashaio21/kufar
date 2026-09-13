@@ -1,0 +1,12 @@
+services:
+  kufar-monitor:
+    build: .
+    container_name: kufar-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - kufar_data:/app/data
+
+volumes:
+  kufar_data:

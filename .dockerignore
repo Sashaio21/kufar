@@ -1,0 +1,6 @@
+.venv
+.vscode
+__pycache__
+*.pyc
+seen_ads.json
+.env
