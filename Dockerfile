@@ -18,8 +18,8 @@ ENV SEEN_IDS_FILE=/app/data/seen_ads.json
 ENV STATE_FILE=/app/data/monitor_state.json
 
 # main.py сам проверяет объявления по расписанию (управляется командами
-# Telegram-бота /interval, /status, /check) и параллельно поднимает HTTP-сервер
-# с эндпоинтом /check - на случай, если захочешь дёргать проверку ещё и снаружи.
+# Telegram-бота /interval, /status, /check). HTTP-сервер поднимается только
+# ради /health - для докера/внешнего мониторинга "жив ли процесс".
 EXPOSE 8080
 
 CMD ["python", "main.py"]

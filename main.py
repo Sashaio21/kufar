@@ -2,19 +2,17 @@
 Мониторинг новых объявлений на re.kufar.by через curl_cffi (имитация
 TLS/HTTP2-отпечатка настоящего браузера) и уведомления в Telegram.
 
-Тут ДВА независимых способа запустить проверку:
+Проверка запускается автоматически, по внутреннему расписанию (фоновый
+поток). Интервал хранится в файле и переживает перезапуск контейнера.
+Всё управление - командами Telegram-бота:
+    /status    - текущий интервал и результат последней проверки
+    /interval  - показать/сменить периодичность (в секундах)
+    /check     - запустить проверку немедленно
+    /help      - список команд
 
-1) Автоматически, по внутреннему расписанию (фоновый поток). Интервал
-   хранится в файле и переживает перезапуск контейнера. Управляется
-   командами Telegram-бота:
-       /status    - текущий интервал и результат последней проверки
-       /interval  - показать/сменить периодичность (в секундах)
-       /check     - запустить проверку немедленно
-       /help      - список команд
-
-2) Вручную/через внешний cron - HTTP-эндпоинт GET/POST /check
-   (остался с прошлой версии, пригодится, если когда-нибудь снова
-   захочешь дёргать снаружи вместо внутреннего расписания).
+Внешнего HTTP-эндпоинта для cron больше нет - расписание полностью
+внутри контейнера. Остался только GET /health для docker/мониторинга,
+чтобы можно было проверить, что процесс жив.
 
 Требуемые библиотеки:
     pip install curl_cffi==0.16.3 beautifulsoup4 pyTelegramBotAPI flask waitress
@@ -27,7 +25,7 @@ import logging
 import threading
 from datetime import datetime
 
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify
 from curl_cffi import requests as cffi_requests
 from curl_cffi.requests.exceptions import RequestException
 from bs4 import BeautifulSoup
@@ -37,21 +35,12 @@ import telebot
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")          # получить у @BotFather
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")      # свой chat_id (узнать у @userinfobot)
-CRON_SECRET = os.environ.get("CRON_SECRET")                # секрет для защиты HTTP /check
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError(
         "Не заданы переменные окружения TELEGRAM_TOKEN и/или TELEGRAM_CHAT_ID. "
         "Передай их при запуске контейнера, например через docker run -e "
         "или через .env файл с docker-compose."
-    )
-
-if not CRON_SECRET:
-    raise RuntimeError(
-        "Не задана переменная окружения CRON_SECRET. Она нужна, чтобы HTTP-эндпоинт "
-        "/check не мог дёргать кто угодно. Придумай случайную строку "
-        "(например: python3 -c \"import secrets; print(secrets.token_urlsafe(32))\") "
-        "и положи в .env."
     )
 
 # Только этот chat_id может управлять ботом командами. Кто угодно другой,
@@ -443,22 +432,7 @@ def bot_polling_loop():
             time.sleep(5)
 
 
-# ---------------------- HTTP /check (для внешнего cron, опционально) ----------------------
-
-def _secret_is_valid():
-    provided = request.headers.get("X-Cron-Secret") or request.args.get("secret")
-    return provided == CRON_SECRET
-
-
-@app.route("/check", methods=["GET", "POST"])
-def check_endpoint():
-    if not _secret_is_valid():
-        return jsonify({"status": "error", "message": "Неверный или отсутствующий секрет"}), 401
-
-    result = check_once()
-    code = 200 if result["status"] in ("ok", "no_data") else 500
-    return jsonify(result), code
-
+# ---------------------- HTTP /health (для докера/мониторинга) ----------------------
 
 @app.route("/health", methods=["GET"])
 def health_endpoint():
@@ -472,8 +446,7 @@ if __name__ == "__main__":
     threading.Thread(target=bot_polling_loop, daemon=True).start()
 
     log.info(
-        "HTTP-сервер запущен на %s:%d (эндпоинт /check доступен и снаружи, "
-        "секрет через X-Cron-Secret или ?secret=...).",
+        "HTTP-сервер запущен на %s:%d (только /health для мониторинга).",
         HOST, PORT,
     )
     try:
