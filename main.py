@@ -1,34 +1,33 @@
 """
 Мониторинг новых объявлений на re.kufar.by через curl_cffi (имитация
-TLS/HTTP2-отпечатка настоящего браузера, без запуска самого браузера)
-и уведомления в Telegram.
+TLS/HTTP2-отпечатка настоящего браузера) и уведомления в Telegram.
+
+Тут ДВА независимых способа запустить проверку:
+
+1) Автоматически, по внутреннему расписанию (фоновый поток). Интервал
+   хранится в файле и переживает перезапуск контейнера. Управляется
+   командами Telegram-бота:
+       /status    - текущий интервал и результат последней проверки
+       /interval  - показать/сменить периодичность (в секундах)
+       /check     - запустить проверку немедленно
+       /help      - список команд
+
+2) Вручную/через внешний cron - HTTP-эндпоинт GET/POST /check
+   (остался с прошлой версии, пригодится, если когда-нибудь снова
+   захочешь дёргать снаружи вместо внутреннего расписания).
 
 Требуемые библиотеки:
-    pip install curl_cffi==0.16.3 beautifulsoup4 pyTelegramBotAPI
-
-Отличие от версии на requests:
-    requests имеет собственный, легко узнаваемый TLS/HTTP2-отпечаток
-    (JA3/JA4), по которому антибот-защиты режут запрос ещё до того,
-    как посмотрят на заголовки. curl_cffi использует патченный libcurl,
-    который умеет выдавать себя за конкретный браузер (Chrome/Safari/Edge)
-    на уровне TLS-рукопожатия — это самая частая причина, почему "requests
-    видит пустую/заблокированную страницу, а браузер - нормальную".
-
-Это НЕ решает проблему, если сайт рендерит список объявлений через JS
-уже в браузере (тогда curl_cffi, как и requests, увидит только каркас
-страницы без данных - JS он не выполняет). В таком случае поможет
-только Selenium/Playwright.
-
-Скрипт пробует несколько профилей imitации браузера и несколько
-стратегий парсинга по очереди, явно пишет в лог, что сработало.
-Если НИ ОДНА комбинация не сработала - он это не скрывает.
+    pip install curl_cffi==0.16.3 beautifulsoup4 pyTelegramBotAPI flask waitress
 """
 
 import json
 import os
 import time
 import logging
+import threading
+from datetime import datetime
 
+from flask import Flask, request, jsonify
 from curl_cffi import requests as cffi_requests
 from curl_cffi.requests.exceptions import RequestException
 from bs4 import BeautifulSoup
@@ -38,6 +37,7 @@ import telebot
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")          # получить у @BotFather
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")      # свой chat_id (узнать у @userinfobot)
+CRON_SECRET = os.environ.get("CRON_SECRET")                # секрет для защиты HTTP /check
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise RuntimeError(
@@ -46,15 +46,31 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         "или через .env файл с docker-compose."
     )
 
+if not CRON_SECRET:
+    raise RuntimeError(
+        "Не задана переменная окружения CRON_SECRET. Она нужна, чтобы HTTP-эндпоинт "
+        "/check не мог дёргать кто угодно. Придумай случайную строку "
+        "(например: python3 -c \"import secrets; print(secrets.token_urlsafe(32))\") "
+        "и положи в .env."
+    )
+
+# Только этот chat_id может управлять ботом командами. Кто угодно другой,
+# кто напишет боту, получит отказ - иначе посторонний человек смог бы
+# менять интервал или дёргать проверки.
+ALLOWED_CHAT_ID = str(TELEGRAM_CHAT_ID)
+
 TARGET_URL = "https://re.kufar.by/l/grodno/snyat/kvartiru/1k?cur=USD&prc=r%3A0%2C200"
 
-CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", 5 * 60))
 SEEN_IDS_FILE = os.environ.get("SEEN_IDS_FILE", "seen_ads.json")
+STATE_FILE = os.environ.get("STATE_FILE", "monitor_state.json")
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", 8080))
 
-# Профили браузера для имитации TLS/HTTP2-отпечатка curl_cffi.
-# Пробуются по очереди, пока один не сработает (см. fetch_current_ads).
-# Полный список поддерживаемых значений смотри в README curl_cffi -
-# он меняется от версии к версии.
+DEFAULT_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", 5 * 60))
+# Защита от того, чтобы через /interval случайно/специально не поставили
+# слишком частый опрос и не словили бан на сайте.
+MIN_INTERVAL_SECONDS = int(os.environ.get("MIN_INTERVAL_SECONDS", 60))
+
 IMPERSONATE_PROFILES = os.environ.get(
     "IMPERSONATE_PROFILES",
     "chrome124,chrome120,chrome110,safari17_0,edge101",
@@ -65,6 +81,8 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+DISABLE_SSL_VERIFY = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -72,7 +90,70 @@ logging.basicConfig(
 log = logging.getLogger("kufar_monitor")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+app = Flask(__name__)
 
+# ---------------------- ОБЩЕЕ СОСТОЯНИЕ ----------------------
+
+state_lock = threading.Lock()
+check_lock = threading.Lock()          # чтобы две проверки не бежали параллельно
+interval_changed_event = threading.Event()
+
+current_interval_seconds = DEFAULT_INTERVAL_SECONDS
+last_check_info = {"time": None, "status": "никогда не запускалась", "message": "", "new_ads": 0, "total_ads": 0}
+
+
+def load_state():
+    global current_interval_seconds
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            current_interval_seconds = int(data.get("interval_seconds", DEFAULT_INTERVAL_SECONDS))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            log.warning("Не удалось прочитать %s, использую интервал по умолчанию.", STATE_FILE)
+
+
+def save_state():
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"interval_seconds": current_interval_seconds}, f, ensure_ascii=False, indent=2)
+
+
+def format_interval(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} ч ({seconds} сек)"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} мин ({seconds} сек)"
+    return f"{seconds} сек"
+
+
+def set_interval(seconds: int):
+    global current_interval_seconds
+    with state_lock:
+        current_interval_seconds = seconds
+        save_state()
+    interval_changed_event.set()  # прерываем текущее ожидание в scheduler_loop
+
+
+def get_interval() -> int:
+    with state_lock:
+        return current_interval_seconds
+
+
+def record_check_result(result: dict):
+    with state_lock:
+        last_check_info["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        last_check_info["status"] = result.get("status")
+        last_check_info["message"] = result.get("message", "")
+        last_check_info["new_ads"] = result.get("new_ads", 0)
+        last_check_info["total_ads"] = result.get("total_ads_on_page", 0)
+
+
+def get_last_check_info() -> dict:
+    with state_lock:
+        return dict(last_check_info)
+
+
+# ---------------------- ПОИСК ОБЪЯВЛЕНИЙ ----------------------
 
 def load_seen_ids():
     if os.path.exists(SEEN_IDS_FILE):
@@ -143,22 +224,10 @@ def strategy_raw_links(soup):
     return ad_urls or None
 
 
-# Поставь True, только если знаешь, что проблема в антивирусе/прокси с
-# SSL-инспекцией на твоей машине, и не можешь быстро это починить.
-# Это отключает проверку подлинности сертификата сайта - небезопасно
-# для постоянного использования, годится как временный обход.
-DISABLE_SSL_VERIFY = False
-
-if DISABLE_SSL_VERIFY:
-    # заставляем pyTelegramBotAPI тоже не проверять сертификат
-    telebot.apihelper.CUSTOM_REQUEST_KWARGS = {"verify": False}
-
-
 def fetch_page():
     """Пробует запросить страницу под разными профилями браузера,
-    пока не получит осмысленный ответ (статус 200). Возвращает
-    (html_text, profile_used) либо кидает исключение, если все
-    профили провалились."""
+    пока не получит HTTP 200. Возвращает (html_text, profile_used)
+    либо кидает исключение, если все профили провалились."""
     last_error = None
 
     for profile in IMPERSONATE_PROFILES:
@@ -212,46 +281,204 @@ def fetch_current_ads():
     return None
 
 
-def check_once():
-    seen = load_seen_ids()
-    try:
-        current_ads = fetch_current_ads()
-    except Exception as e:
-        log.error("Ошибка при запросе страницы: %s", e)
-        return
+def check_once() -> dict:
+    """Одна проверка. Возвращает dict с результатом - используется и
+    HTTP-эндпоинтом, и командой /check, и фоновым расписанием."""
+    if not check_lock.acquire(blocking=False):
+        result = {"status": "skipped", "message": "Проверка уже выполняется, пропускаю"}
+        return result
 
-    if current_ads is None:
-        log.warning(
-            "Не удалось найти объявления ни одним из способов. "
-            "Похоже, сайт рендерит список объявлений через JS уже в браузере "
-            "(curl_cffi, как и requests, такое не видит - он не выполняет JS). "
-            "В этом случае нужен вариант со Selenium/Playwright - скажи, и я "
-            "пришлю такую версию."
+    try:
+        seen = load_seen_ids()
+
+        try:
+            current_ads = fetch_current_ads()
+        except Exception as e:
+            log.error("Ошибка при запросе страницы: %s", e)
+            result = {"status": "error", "message": str(e)}
+            record_check_result(result)
+            return result
+
+        if current_ads is None:
+            msg = (
+                "Не удалось найти объявления ни одним из способов. Похоже, сайт "
+                "рендерит список через JS уже в браузере, либо антибот распознал "
+                "запрос по другим признакам, чем TLS-отпечаток."
+            )
+            log.warning(msg)
+            result = {"status": "no_data", "message": msg}
+            record_check_result(result)
+            return result
+
+        new_ads = [url for url in current_ads if url not in seen]
+
+        if new_ads:
+            log.info("Найдено новых объявлений: %d", len(new_ads))
+            for url in new_ads:
+                try:
+                    bot.send_message(TELEGRAM_CHAT_ID, f"Новое объявление:\n{url}")
+                except Exception as e:
+                    log.error("Не удалось отправить сообщение в Telegram: %s", e)
+
+        save_seen_ids(seen.union(current_ads))
+
+        result = {
+            "status": "ok",
+            "total_ads_on_page": len(current_ads),
+            "new_ads": len(new_ads),
+        }
+        record_check_result(result)
+        return result
+    finally:
+        check_lock.release()
+
+
+# ---------------------- ФОНОВОЕ РАСПИСАНИЕ ----------------------
+
+def scheduler_loop():
+    log.info("Фоновое расписание запущено, интервал: %s", format_interval(get_interval()))
+    while True:
+        check_once()
+        wait_seconds = get_interval()
+        interrupted = interval_changed_event.wait(timeout=wait_seconds)
+        interval_changed_event.clear()
+        if interrupted:
+            log.info("Интервал изменён, применяю новое значение: %s", format_interval(get_interval()))
+
+
+# ---------------------- TELEGRAM-КОМАНДЫ ----------------------
+
+def _authorized(message) -> bool:
+    return str(message.chat.id) == ALLOWED_CHAT_ID
+
+
+HELP_TEXT = (
+    "/status - текущий интервал и результат последней проверки\n"
+    "/interval - показать периодичность\n"
+    "/interval <секунды> - сменить периодичность (минимум "
+    f"{MIN_INTERVAL_SECONDS} сек)\n"
+    "/check - запустить проверку немедленно\n"
+    "/help - это сообщение"
+)
+
+
+@bot.message_handler(commands=["help"])
+def cmd_help(message):
+    if not _authorized(message):
+        return
+    bot.reply_to(message, HELP_TEXT)
+
+
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
+    if not _authorized(message):
+        return
+    info = get_last_check_info()
+    text = (
+        f"Интервал проверки: {format_interval(get_interval())}\n"
+        f"Последняя проверка: {info['time'] or 'ещё не запускалась'}\n"
+        f"Статус: {info['status']}\n"
+    )
+    if info["status"] == "ok":
+        text += f"Объявлений на странице: {info['total_ads']}, новых: {info['new_ads']}"
+    elif info["message"]:
+        text += f"Подробности: {info['message']}"
+    bot.reply_to(message, text)
+
+
+@bot.message_handler(commands=["interval"])
+def cmd_interval(message):
+    if not _authorized(message):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(
+            message,
+            f"Текущий интервал: {format_interval(get_interval())}\n"
+            f"Чтобы изменить: /interval <секунды>, минимум {MIN_INTERVAL_SECONDS}.",
         )
         return
 
-    new_ads = [url for url in current_ads if url not in seen]
+    raw = parts[1].strip()
+    try:
+        seconds = int(raw)
+    except ValueError:
+        bot.reply_to(message, "Нужно целое число секунд, например: /interval 300")
+        return
 
-    if new_ads:
-        log.info("Найдено новых объявлений: %d", len(new_ads))
-        for url in new_ads:
-            try:
-                bot.send_message(TELEGRAM_CHAT_ID, f"Новое объявление:\n{url}")
-            except Exception as e:
-                log.error("Не удалось отправить сообщение в Telegram: %s", e)
+    if seconds < MIN_INTERVAL_SECONDS:
+        bot.reply_to(
+            message,
+            f"Слишком часто - минимум {MIN_INTERVAL_SECONDS} сек, чтобы не словить "
+            f"бан от сайта. Указано: {seconds}.",
+        )
+        return
 
-    save_seen_ids(seen.union(current_ads))
+    set_interval(seconds)
+    bot.reply_to(message, f"Готово. Новый интервал: {format_interval(seconds)}.")
 
 
-def main():
-    log.info(
-        "Запуск мониторинга (curl_cffi). Проверка каждые %d секунд. Профили: %s",
-        CHECK_INTERVAL_SECONDS, ", ".join(p.strip() for p in IMPERSONATE_PROFILES),
-    )
+@bot.message_handler(commands=["check"])
+def cmd_check(message):
+    if not _authorized(message):
+        return
+    bot.reply_to(message, "Запускаю проверку...")
+    result = check_once()
+    if result["status"] == "ok":
+        text = f"Готово. Объявлений на странице: {result['total_ads_on_page']}, новых: {result['new_ads']}."
+    elif result["status"] == "skipped":
+        text = "Проверка уже выполняется прямо сейчас, подожди её результата."
+    else:
+        text = f"Проверка завершилась с проблемой ({result['status']}): {result.get('message', '')}"
+    bot.reply_to(message, text)
+
+
+def bot_polling_loop():
+    log.info("Telegram-бот запущен, слушаю команды (long polling).")
     while True:
-        check_once()
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=30)
+        except Exception as e:
+            log.error("Ошибка long polling, перезапускаю через 5 секунд: %s", e)
+            time.sleep(5)
+
+
+# ---------------------- HTTP /check (для внешнего cron, опционально) ----------------------
+
+def _secret_is_valid():
+    provided = request.headers.get("X-Cron-Secret") or request.args.get("secret")
+    return provided == CRON_SECRET
+
+
+@app.route("/check", methods=["GET", "POST"])
+def check_endpoint():
+    if not _secret_is_valid():
+        return jsonify({"status": "error", "message": "Неверный или отсутствующий секрет"}), 401
+
+    result = check_once()
+    code = 200 if result["status"] in ("ok", "no_data") else 500
+    return jsonify(result), code
+
+
+@app.route("/health", methods=["GET"])
+def health_endpoint():
+    return jsonify({"status": "alive"}), 200
 
 
 if __name__ == "__main__":
-    main()
+    load_state()
+
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+    threading.Thread(target=bot_polling_loop, daemon=True).start()
+
+    log.info(
+        "HTTP-сервер запущен на %s:%d (эндпоинт /check доступен и снаружи, "
+        "секрет через X-Cron-Secret или ?secret=...).",
+        HOST, PORT,
+    )
+    try:
+        from waitress import serve
+        serve(app, host=HOST, port=PORT)
+    except ImportError:
+        log.warning("waitress не установлен - использую встроенный dev-сервер Flask.")
+        app.run(host=HOST, port=PORT)

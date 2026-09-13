@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    ports:
+      - "8080:8080"
     volumes:
       - kufar_data:/app/data
 
